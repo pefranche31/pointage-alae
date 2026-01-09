@@ -1,3 +1,6 @@
+# WORK IN PROGRESS
+-----
+
 # Pointage ALAE - Système de Suivi Dynamique & Cloud
 
 Ce projet est une solution web complète pour la gestion des présences en Accueil de Loisirs Associé à l'École (ALAE). Il permet un suivi en temps réel sur plusieurs appareils, une gestion prévisionnelle automatisée et une résilience totale en cas de perte de connexion internet.
