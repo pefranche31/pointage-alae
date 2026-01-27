@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>ALAE Pointage Hub</title>
+    <!-- Chargement des bibliothèques via CDN -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+    
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;900&display=swap');
+        body { 
+            font-family: 'Inter', sans-serif; 
+            -webkit-tap-highlight-color: transparent; 
+            user-select: none; 
+            background-color: #f8fafc;
+        }
+        .no-scrollbar::-webkit-scrollbar { display: none; }
+        .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        .sticky-col { 
+            position: sticky; 
+            left: 0; 
+            z-index: 20; 
+            background-color: white; 
+        }
+        .safe-top { padding-top: env(safe-area-inset-top); }
+        .modal-overlay { background-color: rgba(15, 23, 42, 0.6); backdrop-filter: blur(4px); }
+        
+        /* Tentative de masquage du bandeau système Google Apps Script */
+        .apps-script-banner-container, 
+        .apps-script-banner,
+        #goog-script-banner,
+        .docs-gm .apps-script-banner-container {
+            display: none !important;
+            height: 0 !important;
+            visibility: hidden !important;
+        }
+
+        /* Animations fluides */
+        .transition-all { transition-property: all; transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1); transition-duration: 300ms; }
+
+        /* FIX CHROME DESKTOP : Force la zone cliquable du calendrier sur tout le bandeau */
+        input[type="date"]::-webkit-calendar-picker-indicator {
+            position: absolute;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            cursor: pointer;
+            opacity: 0;
+        }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+        const CACHE_KEY = "alae_hub_cache_v3";
+        const SYNC_INTERVAL = 120000; // 2 minutes
+        const TIMEZONE = "Europe/Paris";
+
+        const CRENEAUX = [
+            { id: 'matin', label: 'Mat.', icon: 'sunrise', gradient: 'from-amber-400 to-orange-500' },
+            { id: 'midi', label: 'Midi', icon: 'sun', gradient: 'from-sky-400 to-blue-600' },
+            { id: 'soir', label: 'Soir', icon: 'moon', gradient: 'from-indigo-600 to-slate-900' }
+        ];
+
+        // Composant Icône pour Lucide
+        const Icon = ({ name, className }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    iconRef.current.innerHTML = `<i data-lucide="${name}"></i>`;
+                    window.lucide.createIcons({
+                        root: iconRef.current,
+                        attrs: { class: className || "w-4 h-4" }
+                    });
+                }
+            }, [name, className]);
+            return <span ref={iconRef} className="inline-flex items-center justify-center"></span>;
+        };
+
+        // Fonction utilitaire pour extraire l'heure locale de Paris
+        const getParisTimeParts = (date) => {
+            const parts = new Intl.DateTimeFormat('fr-FR', {
+                timeZone: TIMEZONE,
+                hour: 'numeric',
+                minute: 'numeric',
+                hour12: false
+            }).formatToParts(date);
+            
+            const h = parseInt(parts.find(p => p.type === 'hour').value, 10);
+            const m = parseInt(parts.find(p => p.type === 'minute').value, 10);
+            return { h, m };
+        };
+
+        function App() {
+            // --- ÉTATS ---
+            const [loading, setLoading] = useState(true);
+            const [isSyncing, setIsSyncing] = useState(false);
+            const [children, setChildren] = useState([]);
+            const [attendance, setAttendance] = useState({});
+            const [reports, setReports] = useState([]);
+            
+            const [activeTab, setActiveTab] = useState('appel');
+            const [selectedClass, setSelectedClass] = useState('Toutes');
+            const [searchTerm, setSearchTerm] = useState("");
+            const [currentTime, setCurrentTime] = useState(new Date());
+            
+            const [statsLevelFilter, setStatsLevelFilter] = useState('Toutes');
+            const [statsClassFilter, setStatsClassFilter] = useState('Toutes');
+            const [selectedPeriodOption, setSelectedPeriodOption] = useState('maintenant');
+
+            // --- LOGIQUE FUSEAU HORAIRE (PARIS) ---
+            const dateKey = useMemo(() => currentTime.toLocaleDateString('fr-FR', { timeZone: TIMEZONE }), [currentTime]);
+            const fullDateDisplay = useMemo(() => 
+                currentTime.toLocaleDateString('fr-FR', { 
+                    weekday: 'long', day: 'numeric', month: 'long', timeZone: TIMEZONE 
+                }), [currentTime]);
+            
+            const isToday = useMemo(() => {
+                const nowStr = new Date().toLocaleDateString('fr-FR', { timeZone: TIMEZONE });
+                return dateKey === nowStr;
+            }, [dateKey]);
+            
+            const { isPast, isFuture } = useMemo(() => {
+                // Création de dates "pures" (sans heures) pour la comparaison
+                const now = new Date();
+                const todayStr = now.toLocaleDateString('fr-FR', { timeZone: TIMEZONE });
+                // On reconstruit des objets Date à minuit basés sur les chaînes de date locales
+                const parseDate = (str) => {
+                    const [d, m, y] = str.split('/').map(Number);
+                    return new Date(y, m - 1, d);
+                };
+                
+                const currentDateObj = parseDate(dateKey);
+                const todayDateObj = parseDate(todayStr);
+
+                return {
+                    isPast: currentDateObj < todayDateObj,
+                    isFuture: currentDateObj > todayDateObj
+                };
+            }, [dateKey]);
+
+            const dateValueForInput = useMemo(() => {
+                try {
+                    const parts = new Intl.DateTimeFormat('fr-CA', { 
+                        timeZone: TIMEZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+                    }).formatToParts(currentTime);
+                    return `${parts.find(p => p.type === 'year').value}-${parts.find(p => p.type === 'month').value}-${parts.find(p => p.type === 'day').value}`;
+                } catch(e) { return ""; }
+            }, [currentTime]);
+
+            // --- LOGIQUE DE CACHE & SYNCHRO ---
+            const persistToCache = (data) => {
+                localStorage.setItem(CACHE_KEY, JSON.stringify({
+                    children: data.children,
+                    attendance: data.attendance,
+                    reports: data.reports,
+                    timestamp: new Date().getTime()
+                }));
+            };
+
+            const syncData = (isInitial = false) => {
+                if (typeof google === 'undefined' || !google.script) return;
+                setIsSyncing(true);
+                google.script.run
+                    .withSuccessHandler((data) => {
+                        setChildren(data.children || []);
+                        setAttendance(data.attendance || {});
+                        setReports(data.reports || []);
+                        persistToCache(data);
+                        setIsSyncing(false);
+                        if (isInitial) setLoading(false);
+                    })
+                    .withFailureHandler((err) => {
+                        console.error("Erreur Synchro", err);
+                        setIsSyncing(false);
+                        if (isInitial) setLoading(false);
+                    })
+                    .getAppData();
+            };
+
+            // Initialisation
+            useEffect(() => {
+                const cached = localStorage.getItem(CACHE_KEY);
+                if (cached) {
+                    const parsed = JSON.parse(cached);
+                    setChildren(parsed.children || []);
+                    setAttendance(parsed.attendance || {});
+                    setReports(parsed.reports || []);
+                    setLoading(false); // Affiche instantanément le cache
+                    syncData(); // Lance quand même une synchro silencieuse
+                } else {
+                    syncData(true); // Premier chargement bloquant si cache vide
+                }
+            }, []);
+
+            // Polling automatique CONDITIONNEL (Uniquement si "Aujourd'hui")
+            useEffect(() => {
+                let syncTimer;
+                if (isToday) {
+                    syncTimer = setInterval(() => {
+                        // On ne lance la synchro auto que si on est sur la date du jour
+                        syncData();
+                    }, SYNC_INTERVAL);
+                }
+                return () => {
+                    if (syncTimer) clearInterval(syncTimer);
+                };
+            }, [isToday]);
+
+            // Mise à jour de l'horloge (Uniquement si "Aujourd'hui")
+            useEffect(() => {
+                let clockTimer;
+                if (isToday) {
+                    clockTimer = setInterval(() => {
+                        setCurrentTime(new Date());
+                    }, 30000);
+                }
+                return () => {
+                    if (clockTimer) clearInterval(clockTimer);
+                };
+            }, [isToday]);
+
+            // --- ACTIONS ---
+            const togglePresence = (childId, creneau) => {
+                // Sécurité : pas de modification dans le passé
+                if (isPast) return;
+
+                const key = `${dateKey}-${childId}-${creneau}`;
+                const isCurrentlyPresent = attendance[key] === 'present';
+                
+                // Mise à jour optimiste + Cache
+                setAttendance(prev => {
+                    const next = { ...prev, [key]: isCurrentlyPresent ? null : 'present' };
+                    // Mise à jour du cache local pour persistance immédiate
+                    const cached = JSON.parse(localStorage.getItem(CACHE_KEY) || "{}");
+                    localStorage.setItem(CACHE_KEY, JSON.stringify({...cached, attendance: next}));
+                    return next;
+                });
+
+                if (typeof google !== 'undefined') {
+                    google.script.run.togglePresence(dateKey, childId, creneau);
+                }
+            };
+
+            const registerMouvement = (childId, type) => {
+                // Sécurité : mouvements uniquement en temps réel (aujourd'hui)
+                if (!isToday) return;
+
+                const creneau = activePeriodId;
+                
+                if (typeof google !== 'undefined') {
+                    google.script.run
+                        .withSuccessHandler((time) => {
+                            setReports(prev => [...prev, { childId, type, creneau, date: dateKey, time }]);
+                            if (type === 'ARRIVEE') togglePresence(childId, creneau);
+                        })
+                        .logMouvement(childId, type, creneau, dateKey);
+                }
+            };
+
+            // Fonction pour le voyage temporel (Sélection de date)
+            const handleTimeTravel = (e) => {
+                const selectedDateStr = e.target.value; // "YYYY-MM-DD"
+                if (selectedDateStr) {
+                    const [y, m, d] = selectedDateStr.split('-').map(Number);
+                    const newDate = new Date();
+                    newDate.setFullYear(y, m - 1, d);
+                    // On place l'heure à midi pour éviter les sauts de fuseau horaire
+                    newDate.setHours(12, 0, 0, 0); 
+                    setCurrentTime(newDate);
+                }
+            };
+
+            // --- CALCULS ---
+            const getCurrentPeriodId = (date) => {
+                const { h, m } = getParisTimeParts(date);
+                const totalMinutes = h * 60 + m;
+                if (totalMinutes < 9 * 60 + 30) return 'matin';
+                if (totalMinutes < 15 * 60) return 'midi';
+                return 'soir';
+            };
+
+            const activePeriodId = selectedPeriodOption === 'maintenant' ? getCurrentPeriodId(currentTime) : selectedPeriodOption;
+            const activePeriodConfig = CRENEAUX.find(c => c.id === activePeriodId) || CRENEAUX[1];
+
+            const filteredChildren = useMemo(() => {
+                return children.filter(c => {
+                    const matchesClass = selectedClass === 'Toutes' || c.classe === selectedClass;
+                    const matchesSearch = c.nom.toLowerCase().includes(searchTerm.toLowerCase()) || 
+                                          c.prenom.toLowerCase().includes(searchTerm.toLowerCase());
+                    return matchesClass && matchesSearch;
+                });
+            }, [children, selectedClass, searchTerm]);
+
+            const stats = useMemo(() => {
+                const period = activePeriodId;
+                const periodReports = reports.filter(r => r.date === dateKey && r.creneau === period);
+                const data = children.map(c => {
+                    const isMarked = attendance[`${dateKey}-${c.id}-${period}`] === 'present';
+                    const hasDeparted = periodReports.some(r => r.childId === c.id && r.type === 'DEPART');
+                    return { ...c, isMarked, hasDeparted };
+                });
+                const presentOnSite = data.filter(d => d.isMarked && !d.hasDeparted);
+                
+                const levels = { 'Maternelle': { presents: 0, total: 0 }, 'Élémentaire': { presents: 0, total: 0 } };
+                const groups = {};
+                
+                data.forEach(d => {
+                    if (d.isMarked) {
+                        if (d.niveau) {
+                            const lvlKey = d.niveau.trim();
+                            if (!levels[lvlKey]) levels[lvlKey] = { total: 0, presents: 0, sortis: 0 };
+                            
+                            levels[lvlKey].total++;
+                            if (d.hasDeparted) levels[lvlKey].sortis++;
+                            else levels[lvlKey].presents++;
+                        }
+                        if (d.classe) {
+                            if (!groups[d.classe]) groups[d.classe] = { total: 0, presents: 0, sortis: 0, niveau: d.niveau || 'Inconnu' };
+                            groups[d.classe].total++;
+                            if (d.hasDeparted) groups[d.classe].sortis++;
+                            else groups[d.classe].presents++;
+                        }
+                    }
+                });
+
+                return {
+                    totalPresentOnSite: presentOnSite.length,
+                    totalExpected: data.filter(d => d.isMarked).length,
+                    displayList: presentOnSite.filter(c => (statsLevelFilter === 'Toutes' || c.niveau === statsLevelFilter) && (statsClassFilter === 'Toutes' || c.classe === statsClassFilter)).sort((a,b) => a.nom.localeCompare(b.nom)),
+                    groups,
+                    levels
+                };
+            }, [children, attendance, reports, dateKey, activePeriodId, statsLevelFilter, statsClassFilter]);
+
+            if (loading) {
+                return (
+                    <div className="h-screen flex flex-col items-center justify-center bg-white">
+                        <div className="w-10 h-10 border-4 border-indigo-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+                        <p className="text-slate-400 font-black uppercase tracking-widest text-[10px]">Chargement initial...</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex flex-col h-screen max-w-2xl mx-auto bg-white overflow-hidden shadow-2xl relative text-slate-800">
+                    
+                    {/* BANDEAU SUPÉRIEUR INTERACTIF (Time Machine) */}
+                    <div className="relative z-[60] overflow-hidden">
+                        <input 
+                            type="date" 
+                            className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20" 
+                            value={dateValueForInput}
+                            onChange={handleTimeTravel}
+                            title="Choisir une date"
+                        />
+                        <div className={`${isToday ? 'bg-indigo-900 border-indigo-950 hover:bg-indigo-800' : isPast ? 'bg-slate-700 border-slate-800' : 'bg-red-600 border-red-700 animate-pulse hover:bg-red-500'} py-2 text-white px-6 text-center border-b shadow-lg relative z-10 active:scale-[0.98] transition-all duration-300`}>
+                            <div className="flex justify-center items-center gap-4 text-[10px] font-bold uppercase tracking-wider pointer-events-none">
+                                <div className="flex items-center gap-1.5 opacity-90">
+                                    <Icon name="history" className="w-3 h-3" />
+                                    <span>{fullDateDisplay}</span>
+                                </div>
+                                <span className="opacity-30">|</span>
+                                <div className="flex items-center gap-1.5">
+                                    <Icon name="clock" className="w-3 h-3 text-indigo-300" />
+                                    <span className="font-mono text-[11px]">
+                                        {currentTime.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: TIMEZONE })}
+                                    </span>
+                                </div>
+                                <span className="opacity-30">|</span>
+                                <div className="bg-white/10 px-2 py-0.5 rounded border border-white/10 text-[9px] font-black italic">
+                                    {activePeriodConfig.label}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Header compact */}
+                    <header className={`safe-top text-white shadow-md z-50 transition-all duration-500 bg-gradient-to-br ${isToday ? activePeriodConfig.gradient : 'from-slate-600 to-slate-800'}`}>
+                        <div className="px-4 py-3 flex justify-between items-center relative">
+                            <div className="flex-1 flex items-center gap-2">
+                                <h1 className="text-lg font-black tracking-tighter italic leading-none text-white">ALAE HUB</h1>
+                                <div className={`w-2 h-2 rounded-full border border-white/20 ${isSyncing ? 'bg-amber-400 sync-active' : 'bg-emerald-400 opacity-50'}`}></div>
+                            </div>
+
+                            <div className="flex-1 flex justify-end items-center">
+                                <div className="bg-white/20 backdrop-blur-md rounded-xl px-3 py-1.5 border border-white/10 flex items-center gap-2">
+                                    <div className="text-lg font-black leading-none text-white">{stats.totalPresentOnSite}</div>
+                                    <div className="text-[7px] font-black uppercase opacity-60 leading-none text-right text-white">ENFANTS<br/>ICI</div>
+                                </div>
+                            </div>
+                        </div>
+                    </header>
+
+                    {/* Navigation */}
+                    <nav className="bg-white border-b flex z-40 shadow-sm">
+                        {[
+                            { id: 'appel', label: 'Appel', icon: 'users' },
+                            { id: 'flux', label: 'Flux', icon: 'clipboard-list' },
+                            { id: 'stats', label: 'Effectif Réel', icon: 'shield-check' }
+                        ].map(tab => (
+                            <button 
+                                key={tab.id} 
+                                onClick={() => setActiveTab(tab.id)} 
+                                className={`flex-1 py-2 flex flex-col items-center justify-center gap-1 text-[9px] font-black uppercase tracking-widest border-b-2 transition-all ${activeTab === tab.id ? 'border-indigo-600 text-indigo-600 bg-indigo-50/30' : 'border-transparent text-slate-400'}`}
+                            >
+                                <Icon name={tab.icon} className="w-3.5 h-3.5" />
+                                <span>{tab.label}</span>
+                            </button>
+                        ))}
+                    </nav>
+
+                    <div className="bg-white border-b z-30 shadow-sm">
+                        {activeTab !== 'stats' && (
+                            <div className="p-3 space-y-2">
+                                <div className="relative">
+                                    <div className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-300"><Icon name="search" className="w-3.5 h-3.5" /></div>
+                                    <input type="text" placeholder="Rechercher..." className="w-full pl-9 pr-4 py-1.5 bg-slate-50 border border-slate-100 rounded-lg text-xs focus:outline-none font-medium" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)} />
+                                </div>
+                                <div className="flex gap-1.5 overflow-x-auto no-scrollbar">
+                                    {['Toutes', ...new Set(children.map(c => c.classe))].map(cl => (
+                                        <button key={cl} onClick={() => setSelectedClass(cl)} className={`px-3 py-1 rounded-lg text-[9px] font-black uppercase whitespace-nowrap transition-all ${selectedClass === cl ? 'bg-slate-900 text-white shadow-sm' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}>{cl}</button>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    <main className="flex-1 overflow-y-auto no-scrollbar bg-white">
+                        {/* TAB APPEL */}
+                        {activeTab === 'appel' && (
+                            <div className="divide-y divide-slate-100">
+                                {filteredChildren.length > 0 ? filteredChildren.map(child => (
+                                    <div key={child.id} className="flex items-center p-3 active:bg-slate-50 transition-colors">
+                                        <div className="flex-1 min-w-0 mr-3">
+                                            <div className="text-[12px] font-black uppercase truncate leading-none mb-1.5">
+                                                <span className="text-slate-800 mr-2">{child.nom}</span>
+                                                <span className="text-slate-400 font-semibold normal-case">{child.prenom}</span>
+                                            </div>
+                                            <div className="inline-block px-1.5 py-0.5 bg-slate-100 text-slate-500 text-[7px] font-black rounded uppercase tracking-tighter">{child.classe}</div>
+                                        </div>
+                                        <div className="flex gap-1.5">
+                                            {CRENEAUX.map(cr => {
+                                                const active = attendance[`${dateKey}-${child.id}-${cr.id}`] === 'present';
+                                                return (
+                                                    <button 
+                                                        key={cr.id} 
+                                                        onClick={() => togglePresence(child.id, cr.id)} 
+                                                        className={`w-10 h-10 rounded-xl flex items-center justify-center border-2 transition-all ${
+                                                            active ? 'bg-emerald-500 border-emerald-500 text-white shadow-md' : 
+                                                            isPast ? 'bg-slate-50 border-slate-100 text-slate-200 cursor-not-allowed opacity-50' :
+                                                            'bg-white border-slate-100 text-slate-300 active:bg-slate-100'
+                                                        }`}
+                                                    >
+                                                        {active ? <Icon name="check" className="w-4 h-4" /> : <span className="text-[8px] font-black uppercase">{cr.label[0]}</span>}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                )) : <div className="py-10 text-center text-slate-300 text-[10px] font-bold uppercase tracking-widest">Aucun résultat</div>}
+                            </div>
+                        )}
+
+                        {/* TAB FLUX */}
+                        {activeTab === 'flux' && (
+                            <div className="p-3 space-y-3">
+                                {!isToday && (
+                                    <div className="bg-amber-50 border border-amber-200 p-3 rounded-xl text-amber-700 text-[10px] font-bold flex items-center gap-2">
+                                        <Icon name="info" className="w-4 h-4" />
+                                        Mouvements enregistrés pour le {dateKey}. Modification impossible hors date du jour.
+                                    </div>
+                                )}
+                                <div className="divide-y divide-slate-100">
+                                    {filteredChildren.map(child => {
+                                        const period = activePeriodId;
+                                        const entry = reports.find(r => r.childId === child.id && r.date === dateKey && r.creneau === period && r.type === 'ARRIVEE');
+                                        const exit = reports.find(r => r.childId === child.id && r.date === dateKey && r.creneau === period && r.type === 'DEPART');
+                                        const isMarked = attendance[`${dateKey}-${child.id}-${period}`] === 'present';
+                                        return (
+                                            <div key={child.id} className={`py-3 flex items-center justify-between transition-opacity ${exit || !isToday ? 'opacity-40 grayscale' : ''}`}>
+                                                <div className="flex-1 min-w-0 pr-3">
+                                                    <div className="text-[12px] font-black uppercase truncate leading-none">
+                                                        <span className="text-slate-800 mr-2">{child.nom}</span>
+                                                        <span className="text-slate-400 font-semibold normal-case">{child.prenom}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 mt-1.5 text-[7px] font-black text-slate-300 uppercase tracking-tighter">{child.classe} {isMarked && <span className="w-1 h-1 rounded-full bg-emerald-500"></span>}</div>
+                                                </div>
+                                                <div className="flex gap-1.5">
+                                                    <button disabled={entry || !isToday || period !== 'matin'} onClick={() => registerMouvement(child.id, 'ARRIVEE')} className={`px-3 py-1.5 rounded-lg text-[8px] font-black uppercase border-2 transition-all ${entry ? 'bg-emerald-500 border-emerald-500 text-white' : 'bg-white border-slate-100 text-slate-400'}`}>{entry ? entry.time : 'Arrivée'}</button>
+                                                    <button disabled={exit || !isToday || !isMarked} onClick={() => registerMouvement(child.id, 'DEPART')} className={`px-3 py-1.5 rounded-lg text-[8px] font-black uppercase border-2 transition-all ${exit ? 'bg-slate-900 border-slate-900 text-white shadow-sm' : isMarked ? 'bg-white border-indigo-500 text-indigo-500 shadow-sm' : 'bg-white border-slate-50 text-slate-100'}`}>{exit ? exit.time : 'Départ'}</button>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* TAB STATS */}
+                        {activeTab === 'stats' && (
+                            <div className="p-3 space-y-4 animate-in fade-in duration-500">
+                                <div className="bg-indigo-600 rounded-2xl p-4 text-white shadow-lg flex justify-between items-center">
+                                    <div>
+                                        <div className="text-[8px] font-black uppercase opacity-60 mb-0.5 tracking-widest text-white">Effectif sur place</div>
+                                        <div className="text-4xl font-black tracking-tighter text-white">{stats.totalPresentOnSite}</div>
+                                        <div className="text-[7px] font-bold opacity-60 uppercase mt-1 text-white">Sur {stats.totalExpected} attendus • {activePeriodId}</div>
+                                    </div>
+                                    <div className="h-10 w-10 bg-white/20 rounded-xl flex items-center justify-center backdrop-blur-md"><Icon name="shield-check" className="w-5 h-5 text-white" /></div>
+                                </div>
+
+                                <div className="grid grid-cols-2 gap-2">
+                                    {Object.entries(stats.levels).map(([lvl, data]) => (
+                                        <div key={lvl} className="bg-white p-3 rounded-xl border border-slate-100 shadow-sm">
+                                            <span className="text-[8px] font-black uppercase text-slate-400 tracking-tighter">{lvl}</span>
+                                            <div className="flex items-end justify-between">
+                                                <span className="text-xl font-black text-slate-800">{data.presents} <small className="text-[10px] font-bold text-slate-300">/ {data.total}</small></span>
+                                            </div>
+                                            <div className="w-full bg-slate-100 h-1 rounded-full overflow-hidden mt-1">
+                                                <div className="bg-indigo-500 h-full" style={{ width: `${data.total > 0 ? (data.presents/data.total)*100 : 0}%` }}></div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+
+                                <div className="bg-white rounded-xl border border-slate-100 overflow-hidden shadow-sm">
+                                    <div className="bg-slate-50 px-3 py-2 border-b"><span className="text-[8px] font-black uppercase text-slate-400 tracking-widest">Récapitulatif par Classe</span></div>
+                                    <div className="max-h-32 overflow-y-auto no-scrollbar">
+                                        <table className="w-full text-[10px]">
+                                            <tbody className="divide-y divide-slate-50">
+                                                {Object.entries(stats.groups).sort().map(([name, data]) => (
+                                                    <tr key={name}>
+                                                        <td className="px-3 py-1.5 font-bold text-slate-600">{name}</td>
+                                                        <td className="px-3 py-1.5 text-right font-black text-slate-800">{data.presents} / {data.total}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
+
+                                <div className="space-y-2 pt-2 border-t border-slate-100">
+                                    <span className="text-[8px] font-black uppercase text-slate-400 tracking-widest">Liste nominative :</span>
+                                    <div className="flex gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+                                        {['Toutes', 'Maternelle', 'Élémentaire'].map(lvl => (
+                                            <button key={lvl} onClick={() => {setStatsLevelFilter(lvl); setStatsClassFilter('Toutes');}} className={`flex-1 py-1.5 rounded-lg text-[8px] font-black uppercase transition-all border ${statsLevelFilter === lvl ? 'bg-slate-800 border-slate-800 text-white shadow-sm' : 'bg-white border-slate-100 text-slate-400'}`}>{lvl}</button>
+                                        ))}
+                                    </div>
+                                    <div className="flex gap-1.5 overflow-x-auto no-scrollbar py-0.5">
+                                        {['Toutes', ...new Set(children.filter(c => statsLevelFilter === 'Toutes' || c.niveau === statsLevelFilter).map(c => c.classe))].map(cl => (
+                                            <button key={cl} onClick={() => setStatsClassFilter(cl)} className={`px-3 py-1.5 rounded-lg text-[8px] font-black uppercase whitespace-nowrap transition-all border ${statsClassFilter === cl ? 'bg-indigo-600 border-indigo-600 text-white shadow-sm' : 'bg-white border-slate-100 text-slate-400'}`}>{cl}</button>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                <div className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+                                    <div className="divide-y divide-slate-50">
+                                        {stats.displayList.length > 0 ? stats.displayList.map(child => (
+                                            <div key={child.id} className="p-3 flex items-center justify-between hover:bg-slate-50/50">
+                                                <div className="flex-1 min-w-0 pr-4">
+                                                    <div className="text-[11px] font-black uppercase truncate">
+                                                        <span className="text-slate-800 mr-2">{child.nom}</span>
+                                                        <span className="text-slate-400 font-semibold normal-case">{child.prenom}</span>
+                                                    </div>
+                                                    <div className="text-[7px] font-bold text-indigo-400 uppercase tracking-tighter mt-0.5">{child.classe}</div>
+                                                </div>
+                                                <div className="flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_5px_rgba(16,185,129,0.5)]"></div><span className="text-[7px] font-black uppercase text-slate-300 tracking-widest leading-none">PRÉSENT</span></div>
+                                            </div>
+                                        )) : <div className="p-10 text-center text-[9px] font-black uppercase text-slate-400 italic">Aucun enfant correspondant</div>}
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                    </main>
+
+                    {/* Footer */}
+                    <footer className="bg-white border-t p-2 flex justify-between items-center z-50 shadow-inner">
+                        <button 
+                            disabled={isSyncing}
+                            onClick={() => syncData()}
+                            className="flex items-center gap-2 hover:bg-slate-50 p-1.5 rounded-xl transition-all active:scale-95 disabled:opacity-50"
+                        >
+                            <div className={`p-1.5 bg-indigo-50 text-indigo-400 rounded-lg ${isSyncing ? 'animate-spin' : ''}`}>
+                                <Icon name="refresh-cw" className="w-3 h-3" />
+                            </div>
+                            <div className="flex flex-col items-start">
+                                <span className="text-[8px] font-bold text-slate-600 uppercase leading-none">
+                                    {isSyncing ? "Synchronisation..." : "Données en cache"}
+                                </span>
+                                {!isSyncing && <span className="text-[6px] text-slate-400 font-bold uppercase tracking-tighter mt-0.5">Cliquez pour forcer</span>}
+                            </div>
+                        </button>
+                        <div className="flex gap-1">
+                            {['maintenant', 'matin', 'midi', 'soir'].map(opt => (
+                                <button key={opt} onClick={() => setSelectedPeriodOption(opt)} className={`w-7 h-7 rounded-lg flex items-center justify-center transition-all ${selectedPeriodOption === opt ? 'bg-indigo-600 text-white shadow-sm' : 'bg-slate-100 text-slate-300 hover:bg-slate-200'}`}>
+                                    <Icon name={opt === 'maintenant' ? 'clock' : CRENEAUX.find(c => c.id === opt).icon} className="w-3.5 h-3.5" />
+                                </button>
+                            ))}
+                        </div>
+                    </footer>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
